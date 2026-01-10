@@ -62,6 +62,7 @@ use crate::execution_engine::ExecutionEngine;
 use crate::executor::{Executor, TasksDrainedFuture};
 use crate::executor_server::TERMINATING;
 use crate::flight_service::BallistaFlightService;
+use crate::io_executor::{self, IoExecutor};
 use crate::metrics::LoggingMetricsCollector;
 use crate::shutdown::Shutdown;
 use crate::shutdown::ShutdownNotifier;
@@ -107,6 +108,11 @@ pub struct ExecutorProcessConfig {
     pub override_physical_codec: Option<Arc<dyn PhysicalExtensionCodec>>,
     /// [ArrowFlightServerProvider] implementation override option
     pub override_arrow_flight_service: Option<Arc<ArrowFlightServerProvider>>,
+    /// Number of threads for IoExecutor. If None, IoExecutor won't be created
+    /// Recommendation: 2x-4x CPU cores since I/O threads spend most time blocked.
+    pub io_thread_count: Option<usize>,
+    /// Optional I/O executor override for testing or custom configurations
+    pub override_io_executor: Option<Arc<IoExecutor>>,
 }
 
 impl ExecutorProcessConfig {
@@ -151,6 +157,8 @@ impl Default for ExecutorProcessConfig {
             override_logical_codec: None,
             override_physical_codec: None,
             override_arrow_flight_service: None,
+            io_thread_count: None,
+            override_io_executor: None,
         }
     }
 }
@@ -219,6 +227,15 @@ pub async fn start_executor_process(
                     .with_temp_file_path(wd.clone())
                     .build()?;
                 Ok(Arc::new(runtime_env))
+            })
+        });
+
+    // Create IoExecutor if configured
+    let io_executor: Option<Arc<IoExecutor>> =
+        opt.override_io_executor.clone().or_else(|| {
+            opt.io_thread_count.map(|thread_count| {
+                info!("Creating IoExecutor with {thread_count} threads");
+                Arc::new(IoExecutor::new("ballista-io", thread_count))
             })
         });
 
@@ -381,6 +398,7 @@ pub async fn start_executor_process(
                 opt.grpc_max_encoding_message_size as usize,
                 opt.grpc_max_decoding_message_size as usize,
                 opt.grpc_server_config.clone(),
+                io_executor.clone(),
             )
             .await
         }
@@ -491,15 +509,24 @@ async fn flight_server_task(
     max_encoding_message_size: usize,
     max_decoding_message_size: usize,
     grpc_server_config: GrpcServerConfig,
+    io_executor: Option<Arc<IoExecutor>>,
 ) -> JoinHandle<Result<(), BallistaError>> {
     tokio::spawn(async move {
         info!(
             "Built-in arrow flight server listening on: {address:?} max_encoding_size: {max_encoding_message_size} max_decoding_size: {max_decoding_message_size}"
         );
 
+        let flight_service = match io_executor {
+            Some(io_exec) => {
+                info!("Flight service using dedicated IoExecutor");
+                BallistaFlightService::with_io_executor(io_exec)
+            }
+            None => BallistaFlightService::new(),
+        };
+
         let server_future = create_grpc_server(&grpc_server_config)
             .add_service(
-                FlightServiceServer::new(BallistaFlightService::new())
+                FlightServiceServer::new(flight_service)
                     .max_decoding_message_size(max_decoding_message_size)
                     .max_encoding_message_size(max_encoding_message_size),
             )

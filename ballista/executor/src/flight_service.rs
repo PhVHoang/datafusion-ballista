@@ -47,13 +47,24 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::io_executor::IoExecutor;
+use std::sync::Arc;
 /// Service implementing the Apache Arrow Flight Protocol
 #[derive(Clone)]
-pub struct BallistaFlightService {}
+pub struct BallistaFlightService {
+    /// Optional I/O executor for offloading file I/O operations
+    io_executor: Option<Arc<IoExecutor>>,
+}
 
 impl BallistaFlightService {
     pub fn new() -> Self {
-        Self {}
+        Self { io_executor: None }
+    }
+
+    pub fn with_io_executor(io_executor: Arc<IoExecutor>) -> Self {
+        Self {
+            io_executor: io_executor,
+        }
     }
 }
 
@@ -104,11 +115,24 @@ impl FlightService for BallistaFlightService {
 
                 let (tx, rx) = channel(2);
                 let schema = reader.schema();
-                task::spawn_blocking(move || {
-                    if let Err(e) = read_partition(reader, tx) {
-                        log::warn!("error streaming shuffle partition: {e}");
+
+                // Use IoExecutor if available, otherwise fall back to spawn_blocking
+                match &self.io_executor {
+                    Some(io_exec) => {
+                        io_exec.spawn(async move {
+                            if let Err(e) = read_partition(reader, tx) {
+                                log::warn!("error streaming shuffle partition: {e}");
+                            }
+                        });
                     }
-                });
+                    None => {
+                        task::spawn_blocking(move || {
+                            if let Err(e) = read_partition(reader, tx) {
+                                log::warn!("error streaming shuffle partition: {e}");
+                            }
+                        });
+                    }
+                }
 
                 let write_options: IpcWriteOptions = IpcWriteOptions::default()
                     .try_with_compression(Some(CompressionType::LZ4_FRAME))
