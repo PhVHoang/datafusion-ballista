@@ -62,9 +62,11 @@ uuid = { workspace = true }
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
 
-[build-dependencies]
+[[bench]]
 name = "io_executor_bench"
 harness = false
+
+[build-dependencies]
 
 # use libc on unix like platforms to set worker priority in DedicatedExecutor
 [target."cfg(unix)".dependencies.libc]
